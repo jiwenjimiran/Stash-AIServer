@@ -12,6 +12,15 @@ from stashapi.stashapp import StashInterface
 _log = logging.getLogger(__name__)
 
 
+class StashInterfaceUnavailableError(RuntimeError):
+    """Raised when a Stash API method is called but the Stash interface is not connected.
+
+    This typically means STASH_URL is not configured, the Stash server is
+    unreachable, or the connection failed during startup.  Check the
+    ``/system/health`` endpoint or container logs for details.
+    """
+
+
 def _to_relative_path(url: str | None) -> str | None:
     """Convert an absolute Stash URL to a relative path (preserve query/path).
 
@@ -70,6 +79,23 @@ class StashAPI:
             )
             return
 
+        # Verify connectivity immediately so operators see problems at startup
+        # rather than getting cryptic errors when tagging their first scene.
+        try:
+            new_interface.find_tags(filter={"per_page": 1, "page": 1}, fragment="id")
+        except Exception as exc:
+            _log.error(
+                "Stash API client created but cannot reach Stash at %s "
+                "(effective url=%s). Stash operations will fail until "
+                "connectivity is restored. Error: %s",
+                new_url,
+                effective_url,
+                exc,
+            )
+            # Still assign the interface — Stash may come up later and the
+            # health endpoint already surfaces this.  But the log message
+            # makes the problem immediately visible.
+
         self.stash_url = new_url
         self._effective_url = effective_url
         self.api_key = new_key
@@ -85,22 +111,56 @@ class StashAPI:
         else:
             _log.info("Stash API client configured host=%s", self.stash_url)
 
+    def _require_interface(self) -> StashInterface:
+        """Return the active StashInterface or raise a clear error.
+
+        Every method that touches ``self.stash_interface`` should call this
+        instead of accessing the attribute directly.  The resulting error
+        message tells operators *exactly* what is wrong rather than surfacing
+        an opaque ``AttributeError: 'NoneType' object has no attribute …``.
+        """
+        iface = self.stash_interface
+        if iface is not None:
+            return iface
+
+        effective = getattr(self, "_effective_url", None)
+        configured = self.stash_url
+
+        if not configured:
+            raise StashInterfaceUnavailableError(
+                "Stash API is not available because STASH_URL is not configured. "
+                "Set STASH_URL in config.env or via the System Settings UI, then restart."
+            )
+
+        hint_parts = [
+            f"Stash API is not available (configured url={configured!r}",
+        ]
+        if effective and effective != configured:
+            hint_parts.append(f", effective url={effective!r}")
+        hint_parts.append(
+            "). The server may be unreachable or the URL may be wrong. "
+            "Check that Stash is running and accessible from this container. "
+            "If running in Docker, verify network_mode and DOCKER flag in config.env."
+        )
+        raise StashInterfaceUnavailableError("".join(hint_parts))
+
     # Tags
-    
+
     def fetch_tag_id(self, tag_name: str, parent_id: int | None = None, create_if_missing: bool = False, use_cache: bool = True, add_to_cache: Dict[str, int] = None) -> int | None:
         if use_cache and tag_name in self.tag_id_cache:
             return self.tag_id_cache[tag_name]
-        
+
+        client = self._require_interface()
         if create_if_missing:
             if parent_id is None:
-                tag = self.stash_interface.find_tag(tag_name, create=True)["id"]
+                tag = client.find_tag(tag_name, create=True)["id"]
             else:
-                tag = self.stash_interface.find_tag(tag_name)
+                tag = client.find_tag(tag_name)
                 if tag is None:
-                    tag = self.stash_interface.create_tag({"name":tag_name, "ignore_auto_tag": True, "parent_ids":[parent_id]})
+                    tag = client.create_tag({"name":tag_name, "ignore_auto_tag": True, "parent_ids":[parent_id]})
                 tag = tag["id"] if tag else None
         else:
-            tag = self.stash_interface.find_tag(tag_name)
+            tag = client.find_tag(tag_name)
             tag = tag["id"]  if tag else None
         tag = int(tag) if tag is not None else None
         if tag:
@@ -112,14 +172,15 @@ class StashAPI:
         return None
 
     def get_tags_with_parent(self, parent_tag_id: int) -> Dict[str, int]:
-        return {item['name']: item['id'] for item in self.stash_interface.find_tags(f={"parents": {"value":parent_tag_id, "modifier":"INCLUDES"}}, fragment="id name")}
+        client = self._require_interface()
+        return {item['name']: item['id'] for item in client.find_tags(f={"parents": {"value":parent_tag_id, "modifier":"INCLUDES"}}, fragment="id name")}
 
     def get_stash_tag_name(self, tag_id: int) -> str | None:
         """Get the tag name for a given tag ID from Stash."""
         if tag_id in self.tag_name_cache:
             return self.tag_name_cache[tag_id]
         try:
-            tag_data = self.stash_interface.find_tag(tag_id)
+            tag_data = self._require_interface().find_tag(tag_id)
             if tag_data and "name" in tag_data:
                 self.tag_name_cache[tag_id] = tag_data["name"]
                 self.tag_id_cache[tag_data["name"]] = tag_id
@@ -129,18 +190,20 @@ class StashAPI:
             _log.exception("Failed to get tag name for tag_id=%s", tag_id)
             return None
 
-    # Images    
+    # Images
     async def remove_tags_from_images_async(self, image_ids: list[int], tag_ids: list[int]) -> bool:
-        await asyncio.to_thread(self.stash_interface.update_images, {"ids": image_ids, "tag_ids": {"ids": tag_ids, "mode": "REMOVE"}})
+        client = self._require_interface()
+        await asyncio.to_thread(client.update_images, {"ids": image_ids, "tag_ids": {"ids": tag_ids, "mode": "REMOVE"}})
 
     def remove_tags_from_images(self, image_ids: list[int], tag_ids: list[int]) -> bool:
-        self.stash_interface.update_images({"ids": image_ids, "tag_ids": {"ids": tag_ids, "mode": "REMOVE"}})
+        self._require_interface().update_images({"ids": image_ids, "tag_ids": {"ids": tag_ids, "mode": "REMOVE"}})
 
     async def add_tags_to_images_async(self, image_ids: list[int], tag_ids: list[int]) -> bool:
-        await asyncio.to_thread(self.stash_interface.update_images, {"ids": image_ids, "tag_ids": {"ids": tag_ids, "mode": "ADD"}})
+        client = self._require_interface()
+        await asyncio.to_thread(client.update_images, {"ids": image_ids, "tag_ids": {"ids": tag_ids, "mode": "ADD"}})
 
     def add_tags_to_images(self, image_ids: list[int], tag_ids: list[int]) -> bool:
-        self.stash_interface.update_images({"ids": image_ids, "tag_ids": {"ids": tag_ids, "mode": "ADD"}})
+        self._require_interface().update_images({"ids": image_ids, "tag_ids": {"ids": tag_ids, "mode": "ADD"}})
 
     async def get_image_paths_async(self, images_ids: list[int]) -> Dict[int, str]:
         return await asyncio.to_thread(self.get_image_paths, images_ids)
@@ -354,7 +417,7 @@ class StashAPI:
                 "mode": "ADD",
             },
         }
-        self.stash_interface.update_scenes(payload)
+        self._require_interface().update_scenes(payload)
 
     async def remove_tags_from_scene_async(self, scene_id: int, tag_ids: list[int]) -> None:
         await asyncio.to_thread(self.remove_tags_from_scene, scene_id, tag_ids)
@@ -369,7 +432,7 @@ class StashAPI:
                 "mode": "REMOVE",
             },
         }
-        self.stash_interface.update_scenes(payload)
+        self._require_interface().update_scenes(payload)
     
     # Scene Markers
 
@@ -377,13 +440,13 @@ class StashAPI:
         await asyncio.to_thread(self.destroy_scene_markers, marker_ids)
 
     def destroy_scene_markers(self, marker_ids: list[int]):
-        self.stash_interface.destroy_markers(marker_ids)
+        self._require_interface().destroy_markers(marker_ids)
 
     async def destroy_markers_with_tags_async(self, scene_id, tag_ids: list[int]):
         await asyncio.to_thread(self.destroy_markers_with_tags, scene_id, tag_ids)
 
     def destroy_markers_with_tags(self, scene_id, tag_ids: list[int]):
-        markers = self.stash_interface.find_scene_markers(
+        markers = self._require_interface().find_scene_markers(
             scene_marker_filter={
                 "tags": {"value": tag_ids, "modifier": "INCLUDES"},
                 "scenes": {"value": [scene_id], "modifier": "INCLUDES"}
@@ -398,6 +461,7 @@ class StashAPI:
         await asyncio.to_thread(self.create_scene_markers, scene_id, timespans)
 
     def create_scene_markers(self, scene_id: int,timespans: Dict[tuple[int, str], list[tuple[float, float]]]):
+        client = self._require_interface()
         for (tag_id, tag_name), spans in timespans.items():
             for start, end in spans:
                 marker_data = {
@@ -408,7 +472,7 @@ class StashAPI:
                     "tag_ids": [tag_id],
                     "title": tag_name,
                 }
-                self.stash_interface.create_scene_marker(marker_data)
+                client.create_scene_marker(marker_data)
         
 
 def _have_valid_api_key(api_key) -> bool:
