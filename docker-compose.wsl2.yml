@@ -1,0 +1,25 @@
+# Docker Compose override for WSL2 with mirrored networking
+#
+# Use this when running Docker inside WSL2 Ubuntu and Stash runs natively
+# on the Windows host.
+#
+# Why network_mode: host?
+#   In WSL2 mirrored networking mode, host.docker.internal resolves to the
+#   Docker bridge gateway (172.17.0.x) which does NOT route back to the
+#   Windows host.  Using network_mode: host lets the backend share WSL2's
+#   network stack, where localhost reaches both the Windows host (Stash)
+#   and other Docker containers' exposed ports.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.wsl2.yml up -d backend_prod
+#
+# Pair with config.docker.wsl2.sample.env (copy to ./config.env).
+
+services:
+  backend_prod:
+    network_mode: host
+    # network_mode: host is incompatible with 'ports:' mappings, so we
+    # remove them.  The container binds directly to the host's port 4153.
+    ports: !reset []
+    # extra_hosts is unnecessary with host networking.
+    extra_hosts: !reset []
